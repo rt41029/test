@@ -1,7 +1,7 @@
 """
 Бот для GitHub Actions.
 Запускается по cron, смотрит расписание (Киев), заходит на пары, которые
-начинаются в ближайшие 15 минут или начались не более 25 минут назад,
+начинаются в ближайшие 20 минут или начались не более 25 минут назад,
 и сидит до конца пары. Вход в Google — через cookies из секрета GOOGLE_COOKIES.
 
 Переменные окружения (Secrets):
@@ -10,6 +10,7 @@
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   TEST_INDEX          (необязательно) номер пары в списке — зайти на неё прямо
                       сейчас на 3 минуты, для проверки
+  TEST_URL            (необязательно) ссылка на Meet — зайти на 5 минут
 """
 import json
 import os
@@ -39,9 +40,14 @@ except Exception:
     KYIV = ZoneInfo("Europe/Kiev")
 
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-EARLY = timedelta(minutes=15)   # за сколько до начала можно заходить
+EARLY = timedelta(minutes=20)   # за сколько до начала можно заходить
 LATE = timedelta(minutes=25)    # насколько можно опоздать (cron в Actions бывает с задержкой)
 JOIN_LEAD = timedelta(minutes=7)  # за сколько до начала вставать в очередь на вход
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 # ======================= РАСПИСАНИЕ =======================
@@ -90,6 +96,7 @@ def make_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--lang=en-US")
+    opts.add_argument(f"--user-agent={USER_AGENT}")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     # автоматически разрешает доступ к микро/камере (фейковые устройства)
     opts.add_argument("--use-fake-ui-for-media-stream")
@@ -178,7 +185,17 @@ def login_google(driver):
     driver.get("https://accounts.google.com/")
     time.sleep(3)
     logged = "myaccount.google.com" in driver.current_url
-    logger.info(f"[Google] cookies добавлено: {added}, вход: {'да' if logged else 'нет'}")
+    names = {c["name"] for c in cookies if c.get("domain", "").endswith("google.com")}
+    logger.info(
+        f"[Google] cookies добавлено: {added}, вход: {'да' if logged else 'нет'}, "
+        f"url: {driver.current_url}"
+    )
+    logger.info(
+        f"[Google] есть SID: {'SID' in names}, "
+        f"__Secure-1PSID: {'__Secure-1PSID' in names}, LSID: {'LSID' in names}"
+    )
+    if not logged:
+        shot(driver, f"🔍 Google после кук: {driver.current_url[:150]}")
     return logged
 
 

@@ -43,6 +43,7 @@ jobs:
 
       - name: Run bot
         env:
+          GOOGLE_COOKIES: ${{ secrets.GOOGLE_COOKIES }}
           GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
           GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
           SCHEDULE_JSON: ${{ secrets.SCHEDULE_JSON }}

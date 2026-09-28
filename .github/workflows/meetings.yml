@@ -26,6 +26,14 @@ on:
         description: "Проверка: номер пары в schedule.json (с 0). Зайдёт на 3 минуты. Пусто = обычный режим"
         required: false
         default: ""
+      force_index:
+        description: "Принудительно: номер пары (с 0). Зайдёт сразу и просидит до конца пары (ставит меню-бот)"
+        required: false
+        default: ""
+      force_url:
+        description: "Принудительно: ссылка на Google Meet. Зайдёт сразу на 90 минут (ставит меню-бот)"
+        required: false
+        default: ""
 
 jobs:
   join:
@@ -51,4 +59,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_INDEX: ${{ github.event.inputs.test_index }}
           TEST_URL: ${{ github.event.inputs.test_url }}
+          FORCE_INDEX: ${{ github.event.inputs.force_index }}
+          FORCE_URL: ${{ github.event.inputs.force_url }}
         run: python bot.py

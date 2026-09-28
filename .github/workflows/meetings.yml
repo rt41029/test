@@ -2,38 +2,40 @@ name: meetings
 
 on:
   schedule:
-    # Cron работает в UTC. Ниже расписание для ЛЕТНЕГО времени Киева (UTC+3),
-    # каждый запуск за ~15 минут до начала пары (07:59, 09:34, 11:24, 13:00 по Киеву).
-    # Летнее время в Украине заканчивается 25.10.2026 — тогда закомментируйте
-    # блок "ЛЕТО" и раскройте блок "ЗИМА" (UTC+2, всё сдвигается на час позже).
-    # --- ЛЕТО ---
-    - cron: "44 4 * * 1-5"
-    - cron: "19 6 * * 1-5"
-    - cron: "9 8 * * 1-5"
-    - cron: "45 9 * * 1-5"
-    # --- ЗИМА ---
-    # - cron: "44 5 * * 1-5"
-    # - cron: "19 7 * * 1-5"
-    # - cron: "9 9 * * 1-5"
-    # - cron: "45 10 * * 1-5"
+    # Cron — UTC. Киев: лето UTC+3, зима UTC+2 (переход 25.10.2026).
+    # Бот сам встаёт в очередь за 5 минут до пары; cron дёргает его за ~10 минут.
+    # --- ЛЕТО (UTC+3), активно до 25.10.2026 ---
+    - cron: "50 4 * * 1-5"
+    - cron: "25 6 * * 1-5"
+    - cron: "15 8 * * 1-5"
+    - cron: "50 9 * * 1-5"
+    # --- ЗИМА (UTC+2), раскомментировать с 25.10.2026 ---
+    # - cron: "50 5 * * 1-5"
+    # - cron: "25 7 * * 1-5"
+    # - cron: "15 9 * * 1-5"
+    # - cron: "50 10 * * 1-5"
   workflow_dispatch:
     inputs:
       test_url:
-        description: "Проверка: ссылка на Google Meet. Зайдёт на 5 минут. Пусто = обычный режим"
+        description: "Проверка: ссылка Meet, зайдёт на 5 мин"
         required: false
         default: ""
       test_index:
-        description: "Проверка: номер пары в schedule.json (с 0). Зайдёт на 3 минуты. Пусто = обычный режим"
+        description: "Проверка: индекс пары из schedule.json, зайдёт на 3 мин"
         required: false
         default: ""
       force_index:
-        description: "Принудительно: номер пары (с 0). Зайдёт сразу и просидит до конца пары (ставит меню-бот)"
+        description: "Принудительно: индекс пары — зайти сразу и сидеть до конца"
         required: false
         default: ""
       force_url:
-        description: "Принудительно: ссылка на Google Meet. Зайдёт сразу на 90 минут (ставит меню-бот)"
+        description: "Принудительно: ссылка Meet — зайти сразу на 90 мин"
         required: false
         default: ""
+
+concurrency:
+  group: meetings
+  cancel-in-progress: false
 
 jobs:
   join:
@@ -46,19 +48,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
       - name: Install deps
         run: pip install selenium requests
 
       - name: Run bot
         env:
-          GOOGLE_COOKIES: ${{ secrets.GOOGLE_COOKIES }}
-          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
-          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
-          SCHEDULE_JSON: ${{ secrets.SCHEDULE_JSON }}
+          GOOGLE_COOKIES:     ${{ secrets.GOOGLE_COOKIES }}
+          GOOGLE_EMAIL:       ${{ secrets.GOOGLE_EMAIL }}
+          GOOGLE_PASSWORD:    ${{ secrets.GOOGLE_PASSWORD }}
+          SCHEDULE_JSON:      ${{ secrets.SCHEDULE_JSON }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_INDEX: ${{ github.event.inputs.test_index }}
-          TEST_URL: ${{ github.event.inputs.test_url }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_INDEX:  ${{ github.event.inputs.test_index }}
+          TEST_URL:    ${{ github.event.inputs.test_url }}
           FORCE_INDEX: ${{ github.event.inputs.force_index }}
-          FORCE_URL: ${{ github.event.inputs.force_url }}
+          FORCE_URL:   ${{ github.event.inputs.force_url }}
         run: python bot.py

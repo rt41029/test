@@ -101,9 +101,8 @@ def make_driver():
     opts.add_argument("--lang=en-US")
     opts.add_argument(f"--user-agent={USER_AGENT}")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    # автоматически разрешает доступ к микро/камере (фейковые устройства)
+    # автоматически отвечает на запрос доступа к микро/камере (устройства не подменяем)
     opts.add_argument("--use-fake-ui-for-media-stream")
-    opts.add_argument("--use-fake-device-for-media-stream")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     return webdriver.Chrome(options=opts)
@@ -290,7 +289,19 @@ def login_google(driver):
 
         url = driver.current_url
         logger.info(f"[Google] после пароля url: {url}")
-        if any(x in url for x in ("challenge", "rejected", "deniedsigninrejected")) \
+        if "challenge" in url:
+            # «Verify it's you» — подтверждение на телефоне, ждём
+            shot(driver, "📱 Google просит подтвердить вход. Открой телефон, нажми Да и выбери число с картинки (4 мин)")
+            end = time.time() + 240
+            while time.time() < end and "challenge" in driver.current_url:
+                time.sleep(3)
+            url = driver.current_url
+            logger.info(f"[Google] после подтверждения url: {url}")
+            if "challenge" in url:
+                shot(driver, f"🔍 Подтверждение не дождался ({url[:120]})")
+                return False
+            time.sleep(3)
+        if any(x in url for x in ("rejected", "deniedsigninrejected")) \
                 or "accounts.google.com/signin" in url:
             shot(driver, f"🔍 Google не пустил ({url[:120]})")
             return False
@@ -308,33 +319,45 @@ def login_google(driver):
 
 # ======================= GOOGLE MEET =======================
 MIC_OFF = [
-    "//*[@role='button' and (contains(@aria-label,'Turn off microphone') or contains(@aria-label,'Вимкнути мікрофон'))]",
+    "//*[@role='button' and (contains(@aria-label,'Turn off microphone') or contains(@aria-label,'Отключить микрофон') or contains(@aria-label,'Вимкнути мікрофон'))]",
 ]
 CAM_OFF = [
-    "//*[@role='button' and (contains(@aria-label,'Turn off camera') or contains(@aria-label,'Вимкнути камеру'))]",
+    "//*[@role='button' and (contains(@aria-label,'Turn off camera') or contains(@aria-label,'Отключить камеру') or contains(@aria-label,'Вимкнути камеру'))]",
 ]
-NAME_INPUT = "//input[@placeholder='Your name' or contains(@placeholder,'ім')]"
+NAME_INPUT = "//input[@placeholder='Your name' or contains(@placeholder,'ім') or contains(@placeholder,'Ваше имя')]"
+DISMISS_POPUP = [
+    "//span[contains(text(),'Не сейчас')]",
+    "//span[contains(text(),'Не зараз')]",
+    "//span[contains(text(),'Not now')]",
+]
 MEET_JOIN = [
     "//span[contains(text(),'Join now')]",
     "//span[contains(text(),'Ask to join')]",
+    "//span[contains(text(),'Присоедин')]",
     "//span[contains(text(),'Приєднатися')]",
-    "//span[contains(text(),'Попросити')]",
+    "//span[contains(text(),'Попросить')]",
+    "//span[contains(text(),'Попроситися')]",
     "//span[contains(text(),'Запросити')]",
 ]
 MEET_IN_CALL = [
     "//*[contains(@aria-label,'Leave call')]",
-    "//*[contains(@aria-label,'Покинути')]",
+    "//*[contains(@aria-label,'Покин')]",
+    "//*[contains(@aria-label,'Выйти')]",
     "//*[contains(@aria-label,'Вийти')]",
 ]
 
 
 def join_meet(m, driver, subject):
-    driver.get(m["url"])
+    url = m["url"]
+    if "hl=" not in url:
+        url += ("&" if "?" in url else "?") + "hl=en"
+    driver.get(url)
     if not exists_any(driver, MEET_JOIN, timeout=45):
         shot(driver, f"⚠️ <b>Meet</b>: нет кнопки входа в «{subject}»")
         return False
 
-    click_any(driver, MIC_OFF, timeout=3)
+    click_any(driver, DISMISS_POPUP, timeout=3)   # окно «Получать уведомления»
+    click_any(driver, MIC_OFF, timeout=3)         # микрофон и камера выключены
     click_any(driver, CAM_OFF, timeout=3)
 
     # гостевой вход — нужно имя

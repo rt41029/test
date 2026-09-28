@@ -28,7 +28,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-from notifier import send_telegram, send_photo
+from notifier import send_telegram, send_photo, get_update_offset, wait_for_reply
 
 logging.basicConfig(
     level=logging.INFO,
@@ -175,6 +175,36 @@ PASS_XP = [
 ]
 
 
+CAPTCHA_XP = [
+    "//input[@name='ca']",
+    "//input[@id='ca']",
+    "//input[contains(@aria-label,'Type the text')]",
+    "//input[contains(@aria-label,'Введіть текст')]",
+]
+
+
+def solve_captcha(driver, tries=3):
+    """Если Google показал капчу — шлёт скриншот в Telegram, ждёт ответ текстом и вводит его.
+    Возвращает True, если капчи нет или она пройдена."""
+    for attempt in range(tries):
+        if not exists_any(driver, CAPTCHA_XP, timeout=3):
+            return True
+        offset = get_update_offset()
+        shot(driver, "🔤 Google просит капчу. Ответь сюда текстом с картинки (3 мин)")
+        text = wait_for_reply(offset, timeout=180)
+        if not text:
+            send_telegram("⌛ Капчу не дождался")
+            return False
+        box = find_visible(driver, CAPTCHA_XP)
+        if not box:
+            return True
+        box.click()
+        box.send_keys(text)
+        box.send_keys(Keys.ENTER)
+        time.sleep(4)
+    return not exists_any(driver, CAPTCHA_XP, timeout=2)
+
+
 def is_logged_in(driver):
     driver.get("https://myaccount.google.com/?hl=en")
     time.sleep(3)
@@ -240,6 +270,9 @@ def login_google(driver):
         box.click()
         box.send_keys(email)
         box.send_keys(Keys.ENTER)
+        time.sleep(3)
+        if not solve_captcha(driver):
+            return False
 
         if not exists_any(driver, PASS_XP, timeout=25):
             logger.info(f"[Google] нет поля пароля, url: {driver.current_url}")
@@ -250,7 +283,10 @@ def login_google(driver):
         box.click()
         box.send_keys(password)
         box.send_keys(Keys.ENTER)
-        time.sleep(8)
+        time.sleep(6)
+        if not solve_captcha(driver):
+            return False
+        time.sleep(3)
 
         url = driver.current_url
         logger.info(f"[Google] после пароля url: {url}")

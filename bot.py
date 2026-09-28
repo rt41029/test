@@ -428,13 +428,52 @@ def join_zoom(m, driver, subject):
 
 
 # ======================= ПРОЦЕСС ОДНОЙ ПАРЫ =======================
-def stay_until_end(m):
+def present_any(driver, xpaths):
+    """Элемент есть на странице (панель управления может быть скрыта, поэтому видимость не проверяем)."""
+    for xp in xpaths:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def detect_reason(driver):
+    try:
+        text = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        return "браузер не отвечает"
+    if any(k in text for k in ("removed", "удалил", "видалил", "вилучен")):
+        return "похоже, вас удалили из встречи"
+    if any(k in text for k in ("ended", "завершен", "завершил", "завершено", "закінчен")):
+        return "похоже, встреча завершена"
+    if any(k in text for k in ("rejoin", "вернуться", "повернутися", "return to home", "главный экран", "головний екран")):
+        return "вы вышли из встречи"
+    return "причина неизвестна"
+
+
+def monitor_meeting(m, driver, platform, subject):
+    """Сидит до конца пары и следит, что мы всё ещё в звонке.
+    True — досидели до конца; False — вылетели/удалили раньше."""
+    in_call = MEET_IN_CALL if platform == "google_meet" else ZOOM_IN_CALL
     end = end_dt(m, datetime.now(KYIV))
+    misses = 0
     while True:
         left = (end - datetime.now(KYIV)).total_seconds()
         if left <= 0:
-            return
-        time.sleep(min(30, left))
+            return True
+        time.sleep(min(20, left))
+        if (end - datetime.now(KYIV)).total_seconds() <= 0:
+            return True
+        ok = present_any(driver, in_call)
+        misses = 0 if ok else misses + 1
+        if misses >= 2:  # две проверки подряд, чтобы не реагировать на мигание интерфейса
+            reason = detect_reason(driver)
+            logger.warning(f"[{platform}] вылетели из «{subject}»: {reason}")
+            send_telegram(f"🚫 <b>{platform}</b>: вышло из «{subject}» до конца пары\n{reason}")
+            shot(driver, f"📸 Экран в момент выхода («{subject}»)")
+            return False
 
 
 def wait_for_start(m):
@@ -453,6 +492,7 @@ def run_meeting(m, test=False):
 
     driver = None
     joined = False
+    kicked = False
     try:
         if not test:
             wait_for_start(m)
@@ -469,8 +509,9 @@ def run_meeting(m, test=False):
             return
 
         if joined:
-            send_telegram(f"✅ <b>{platform}</b>: на паре «{subject}»\n⏰ до {m['end_time']}")
-            stay_until_end(m)
+            shot(driver, f"✅ <b>{platform}</b>: на паре «{subject}»\n⏰ до {m['end_time']}")
+            if not monitor_meeting(m, driver, platform, subject):
+                kicked = True
     except Exception as e:
         logger.error(f"Ошибка ({label}): {type(e).__name__}")
         if driver:
@@ -481,8 +522,8 @@ def run_meeting(m, test=False):
                 driver.quit()
             except Exception:
                 pass
-        if joined:
-            send_telegram(f"🚪 <b>{platform}</b>: вышел из «{subject}»")
+        if joined and not kicked:
+            send_telegram(f"🚪 <b>{platform}</b>: пара «{subject}» закончилась, вышел")
         logger.info(f"Завершено: {label}")
 
 

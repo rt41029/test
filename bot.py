@@ -1,32 +1,26 @@
 """
-Бот для GitHub Actions.
-Запускается по cron, смотрит расписание (Киев), заходит на пары, которые
-начинаются в ближайшие 20 минут или начались не более 25 минут назад,
-и сидит до конца пары. Вход в Google — по cookies (если есть) или по почте и паролю.
+Meet/Zoom бот для GitHub Actions (Киевское время).
 
-Кнопки в Telegram (под сообщениями бота):
-  📸 Скрин        — свежий скриншот браузера
-  ℹ️ Статус       — в звонке или нет, сколько осталось до конца пары
-  ⏱ +15 мин      — продлить пару (если препод затянул)
-  🔄 Перезайти    — зайти во встречу заново (после вылета / удаления / зависания)
-  🚪 Выйти        — выйти со встречи и закрыть браузер
+Что умеет:
+  • Сам встаёт в очередь на вход за JOIN_LEAD (5) минут до начала пары.
+  • Вход в Google: cookies → клик по своей плашке на «Choose an account»
+    (в т.ч. Signed out) → email+пароль → капча (решается текстом из Telegram)
+    → 2FA (число само извлекается и присылается в Telegram).
+  • Вылетел со встречи — автоматически перезаходит (до AUTO_REJOIN раз),
+    дальше решается кнопками.
+  • Всё решается из Telegram: кнопки 📸 ℹ️ ⏱ 🔄 🚪 + ответ текстом на капчу.
 
-Переменные окружения (Secrets):
-  GOOGLE_EMAIL        почта Google-аккаунта
-  GOOGLE_PASSWORD     пароль Google-аккаунта
-  GOOGLE_COOKIES      (необязательно) JSON со списком cookies Google — пробуется первым
-  SCHEDULE_JSON       содержимое schedule.json (если нет локального файла)
+Secrets GitHub:
+  GOOGLE_EMAIL, GOOGLE_PASSWORD, GOOGLE_COOKIES (опц. JSON),
+  SCHEDULE_JSON (опц., иначе schedule.json из репо),
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  TEST_INDEX          (необязательно) номер пары в списке — зайти на неё прямо
-                      сейчас на 3 минуты, для проверки
-  TEST_URL            (необязательно) ссылка на Meet — зайти на 5 минут
-  FORCE_INDEX         (ставит меню-бот) номер пары — зайти прямо сейчас и сидеть до конца пары
-  FORCE_URL           (ставит меню-бот) ссылка на Meet — зайти прямо сейчас на FORCE_LEN
+Inputs workflow:
+  TEST_URL / TEST_INDEX (проверка), FORCE_URL / FORCE_INDEX (принудительно).
 """
 import json
 import os
 import queue
-import sys
+import re
 import time
 import logging
 import multiprocessing
@@ -55,12 +49,17 @@ try:
 except Exception:
     KYIV = ZoneInfo("Europe/Kiev")
 
-DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-EARLY = timedelta(minutes=20)   # за сколько до начала можно заходить
-LATE = timedelta(minutes=25)    # насколько можно опоздать (cron в Actions бывает с задержкой)
-JOIN_LEAD = timedelta(minutes=7)  # за сколько до начала вставать в очередь на вход
-EXTEND = timedelta(minutes=15)  # на сколько продлевает кнопка «+15 мин»
-FORCE_LEN = timedelta(minutes=90)  # сколько сидим при принудительном входе, если пара уже закончилась / нет времени конца
+DAYS = ["monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday"]
+
+EARLY = timedelta(minutes=20)       # за сколько до начала пара считается «своей»
+LATE = timedelta(minutes=25)        # насколько можно опоздать (задержка cron)
+PREP_LEAD = timedelta(minutes=8)    # за сколько до пары запускаем браузер и логин
+JOIN_LEAD = timedelta(minutes=5)    # за сколько до пары жмём «Join/Ask to join»
+EXTEND = timedelta(minutes=15)      # на сколько продлевает «⏱ +15 мин»
+FORCE_LEN = timedelta(minutes=90)
+AUTO_REJOIN = 2                     # автоперезаходов при вылете до ожидания кнопок
+QUEUE_UPDATE = 120                  # сек: как часто шлём скрин «в очереди»
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -78,14 +77,14 @@ BTN = {
 
 
 def buttons(idx, *acts):
-    """Клавиатура под сообщением. callback_data = действие|id запуска|номер пары."""
+    """callback_data = действие|id запуска|номер пары."""
     run = os.getenv("RUN_ID", "0")
     items = [(BTN[a], f"{a}|{run}|{idx}") for a in acts]
     return [items[i:i + 3] for i in range(0, len(items), 3)]
 
 
 class Ctx:
-    """Всё, что нужно процессу одной пары."""
+    """Состояние процесса одной пары."""
 
     def __init__(self, m, idx, inbox):
         self.m = m
@@ -94,6 +93,7 @@ class Ctx:
         self.driver = None
         self.subject = m.get("subject", "без названия")
         self.platform = m["platform"]
+        self.rejoins = 0  # сколько автоперезаходов уже сделали
 
     def btn(self, *acts):
         return buttons(self.idx, *acts)
@@ -111,29 +111,36 @@ def load_schedule():
         return json.load(f)
 
 
-def start_dt(m, now):
-    h, mi = map(int, m["start_time"].split(":"))
+def _t(m, key, now):
+    h, mi = map(int, m[key].split(":"))
     return now.replace(hour=h, minute=mi, second=0, microsecond=0)
+
+
+def start_dt(m, now):
+    return _t(m, "start_time", now)
 
 
 def end_dt(m, now):
-    h, mi = map(int, m["end_time"].split(":"))
-    return now.replace(hour=h, minute=mi, second=0, microsecond=0)
+    return _t(m, "end_time", now)
 
 
 def seconds_left(m):
-    return (end_dt(m, datetime.now(KYIV)) - datetime.now(KYIV)).total_seconds()
+    now = datetime.now(KYIV)
+    return (end_dt(m, now) - now).total_seconds()
 
 
 def pick_due(meetings, now):
+    """Пары сегодня, которые идут/вот-вот начнутся. Возвращает [(idx, m)]."""
     today = DAYS[now.weekday()]
     due = []
-    for m in meetings:
+    for i, m in enumerate(meetings):
+        if not m.get("enabled", True):      # тогл из меню-бота (KV)
+            continue
         if m.get("day", "").lower() != today:
             continue
         s = start_dt(m, now)
         if s - EARLY <= now <= s + LATE and now < end_dt(m, now):
-            due.append(m)
+            due.append((i, m))
     return due
 
 
@@ -148,7 +155,6 @@ def make_driver():
     opts.add_argument("--lang=en-US")
     opts.add_argument(f"--user-agent={USER_AGENT}")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    # автоматически отвечает на запрос доступа к микро/камере (устройства не подменяем)
     opts.add_argument("--use-fake-ui-for-media-stream")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
@@ -185,8 +191,18 @@ def exists_any(driver, xpaths, timeout=0):
         time.sleep(1)
 
 
+def present_any(driver, xpaths):
+    """Элемент есть в DOM (панель звонка может быть невидима — видимость не важна)."""
+    for xp in xpaths:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def find_visible(driver, xpaths):
-    """Первый видимый элемент по любому из xpath (или None)."""
     for xp in xpaths:
         try:
             for el in driver.find_elements(By.XPATH, xp):
@@ -198,7 +214,6 @@ def find_visible(driver, xpaths):
 
 
 def shot(driver, caption, btns=None):
-    """Скриншот в Telegram. Если скрин не получился — хотя бы текст с кнопками."""
     try:
         send_photo(driver.get_screenshot_as_png(), caption, btns)
     except Exception:
@@ -215,7 +230,6 @@ def drain(q):
 
 
 def wait_text(q, timeout):
-    """Ждёт текстовое сообщение (например, ответ на капчу)."""
     end = time.time() + timeout
     while True:
         left = end - time.time()
@@ -227,17 +241,6 @@ def wait_text(q, timeout):
             return None
         if kind == "text":
             return val
-
-
-def present_any(driver, xpaths):
-    """Элемент есть на странице (панель управления может быть скрыта, поэтому видимость не проверяем)."""
-    for xp in xpaths:
-        try:
-            if driver.find_elements(By.XPATH, xp):
-                return True
-        except Exception:
-            pass
-    return False
 
 
 def send_status(ctx):
@@ -259,13 +262,12 @@ def send_status(ctx):
 def extend(ctx):
     e = end_dt(ctx.m, datetime.now(KYIV)) + EXTEND
     ctx.m["end_time"] = e.strftime("%H:%M")
-    send_telegram(f"⏱ Пара продлена до {ctx.m['end_time']}")
+    send_telegram(f"⏱ Пара «{ctx.subject}» продлена до {ctx.m['end_time']}")
 
 
 def wait_cmd(ctx, timeout):
-    """Ждёт нажатие кнопки до timeout секунд.
-    Скрин / статус / продление выполняет сама и продолжает ждать.
-    Возвращает 'rejoin' или 'leave', либо None, если время вышло."""
+    """Ждёт кнопку до timeout сек. Скрин/статус/+15 выполняет и ждёт дальше.
+    Возвращает 'rejoin' / 'leave' / None."""
     end = time.time() + timeout
     while True:
         left = end - time.time()
@@ -279,7 +281,8 @@ def wait_cmd(ctx, timeout):
             continue
         if val == "shot":
             if ctx.driver:
-                shot(ctx.driver, f"📸 «{ctx.subject}»", ctx.btn("status", "plus", "rejoin", "leave"))
+                shot(ctx.driver, f"📸 «{ctx.subject}»",
+                     ctx.btn("status", "plus", "rejoin", "leave"))
         elif val == "status":
             send_status(ctx)
         elif val == "plus":
@@ -289,11 +292,19 @@ def wait_cmd(ctx, timeout):
 
 
 def wait_admit(ctx, fail_text):
-    """Ждёт, пока впустят (до конца пары). Параллельно слушает кнопки.
+    """Ждёт, пока впустят, до конца пары. Шлёт периодические скрины очереди.
     Возвращает 'ok' / 'fail' / 'rejoin' / 'leave'."""
+    last_upd = 0.0
     while seconds_left(ctx.m) > 0:
         if exists_any(ctx.driver, ctx.in_call_xp(), timeout=0):
             return "ok"
+        now = time.time()
+        if now - last_upd > QUEUE_UPDATE:
+            last_upd = now
+            shot(ctx.driver,
+                 f"⏳ <b>{ctx.platform}</b>: всё ещё в очереди в «{ctx.subject}» "
+                 f"(осталось {max(0, int(seconds_left(ctx.m)//60))} мин до конца)",
+                 ctx.btn("shot", "rejoin", "leave"))
         act = wait_cmd(ctx, 3)
         if act:
             return act
@@ -302,8 +313,6 @@ def wait_admit(ctx, fail_text):
 
 
 # ======================= ВХОД В GOOGLE =======================
-# У формы входа Google поле почты часто type="text", а не "email" —
-# поэтому ищем ещё и по id / name / autocomplete.
 EMAIL_XP = [
     "//input[@id='identifierId']",
     "//input[@name='identifier']",
@@ -316,24 +325,90 @@ PASS_XP = [
     "//input[@autocomplete='current-password']",
     "//input[@type='password']",
 ]
-
-
+# Капча с текстовым полем (старая форма Google)
 CAPTCHA_XP = [
     "//input[@name='ca']",
     "//input[@id='ca']",
     "//input[contains(@aria-label,'Type the text')]",
     "//input[contains(@aria-label,'Введіть текст')]",
+    "//input[contains(@aria-label,'Введите текст')]",
+]
+# reCAPTCHA: фрейм + чекбокс «Я не робот»
+RECAPTCHA_FRAME = "//iframe[contains(@title,'reCAPTCHA') or contains(@src,'recaptcha')]"
+RECAPTCHA_BOX = ("//span[@id='recaptcha-anchor' and not(contains(@class,'checked'))]"
+                 " | //div[@class='recaptcha-checkbox-border']")
+# Плашка своего аккаунта на «Choose an account» (data-identifier = email)
+PROFILE_XP = lambda email: [
+    f"//*[@data-identifier='{email}']",
+    f"//*[contains(@aria-label,'{email}')]",
+    f"//*[contains(text(),'{email}')]/ancestor::*[@role='link' or @role='button'][1]",
+]
+# Кнопки «согласен/далее» на неизвестных промежуточных экранах
+GENERIC_OK = [
+    "//button[.//*[contains(text(),'Далее')]] | //button[contains(text(),'Далее')]",
+    "//button[.//*[contains(text(),'Next')]] | //button[contains(text(),'Next')]",
+    "//button[contains(text(),'Продолжить') or contains(text(),'Continue')]",
+    "//button[contains(text(),'Принимаю') or contains(text(),'I agree')]",
+    "//button[contains(text(),'Подтвердить') or contains(text(),'Confirm')]",
+    "//button[contains(text(),'Да') or contains(text(),'Yes')]",
+]
+
+NUM_PATTERNS = [
+    r"(?:Tap|Нажмите|Натисніть|Нажми|нажми|Натисніть)\s+(\d{1,2})",
+    r"(?:number|число|цифру|цифру)\s+(\d{1,2})",
+    r"\b(\d{2})\b",
 ]
 
 
+def extract_2fa_number(driver):
+    try:
+        text = driver.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        return None
+    for p in NUM_PATTERNS:
+        m = re.search(p, text, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def try_recaptcha_checkbox(driver):
+    """Пытается ткнуть в чекбокс reCAPTCHA. True — если кликнули."""
+    try:
+        frames = driver.find_elements(By.XPATH, RECAPTCHA_FRAME)
+        for fr in frames:
+            try:
+                driver.switch_to.frame(fr)
+                box = find_visible(driver, [RECAPTCHA_BOX])
+                if box:
+                    box.click()
+                    time.sleep(5)
+                    return True
+            except Exception:
+                pass
+            finally:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
+
 def solve_captcha(driver, inbox, tries=3):
-    """Если Google показал капчу — шлёт скриншот в Telegram, ждёт ответ текстом и вводит его.
+    """Капча решается из Telegram: скриншот -> ждём текст -> вводим.
     Возвращает True, если капчи нет или она пройдена."""
     for attempt in range(tries):
         if not exists_any(driver, CAPTCHA_XP, timeout=3):
             return True
+        # сначала пробуем галочку «Я не робот» — иногда капча снимается сама
+        if try_recaptcha_checkbox(driver):
+            if not exists_any(driver, CAPTCHA_XP, timeout=3):
+                send_telegram("✅ Капча снялась галочкой «Я не робот»")
+                return True
         drain(inbox)
-        shot(driver, "🔤 Google просит капчу. Ответь сюда текстом с картинки (3 мин)")
+        shot(driver, "🔤 <b>Капча Google</b>\nОтветь СЮДА текстом с картинки (3 мин)")
         text = wait_text(inbox, 180)
         if not text:
             send_telegram("⌛ Капчу не дождался")
@@ -352,11 +427,43 @@ def is_logged_in(driver):
     driver.get("https://myaccount.google.com/?hl=en")
     time.sleep(3)
     url = driver.current_url
-    return "myaccount.google.com" in url and "signin" not in url and "accounts.google.com" not in url
+    return "myaccount.google.com" in url and "signin" not in url \
+        and "accounts.google.com" not in url
+
+
+def click_profile_if_chooser(driver, email):
+    """Если Google показывает 'Choose an account' (Signed out) — кликает
+    по плашке своего аккаунта. True — кликнули."""
+    end = time.time() + 8
+    while time.time() < end:
+        try:
+            ids = driver.find_elements(By.XPATH, "//*[@data-identifier]")
+            if ids:
+                for xp in PROFILE_XP(email):
+                    for el in driver.find_elements(By.XPATH, xp):
+                        if el.is_displayed():
+                            try:
+                                el.click()
+                                logger.info("[Google] клик по своему профилю (chooser)")
+                                time.sleep(2.5)
+                                return True
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def click_through_generic(driver, rounds=3):
+    """Жмёт «Далее/Принимаю/Continue» на неизвестных экранах Google."""
+    for _ in range(rounds):
+        if not click_any(driver, GENERIC_OK, timeout=2):
+            return
+        time.sleep(2)
 
 
 def login_with_cookies(driver):
-    """Вход по cookies из секрета GOOGLE_COOKIES. Возвращает True, если вошли."""
     raw = os.getenv("GOOGLE_COOKIES", "").strip()
     if not raw:
         return False
@@ -364,11 +471,11 @@ def login_with_cookies(driver):
         cookies = json.loads(raw)
         driver.get("https://accounts.google.com/")
         time.sleep(2)
-        added = 0
-        failed = []
+        added, failed = 0, []
         for c in cookies:
             cookie = {k: v for k, v in c.items()
-                      if k in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry")}
+                      if k in ("name", "value", "domain", "path", "secure",
+                               "httpOnly", "expiry")}
             if "expiry" in cookie:
                 try:
                     cookie["expiry"] = int(cookie["expiry"])
@@ -378,14 +485,12 @@ def login_with_cookies(driver):
                 driver.add_cookie(cookie)
                 added += 1
             except Exception:
-                # cookie чужого домена (например .youtube.com) — пропускаем
                 failed.append(f"{c.get('name')}@{c.get('domain')}")
-        logger.info(f"[Google] cookies добавлено: {added}/{len(cookies)}")
-        logger.info(f"[Google] не добавлены (только имена): {failed}")
+        logger.info(f"[Google] cookies: {added}/{len(cookies)} (не влезли: {failed})")
         logged = is_logged_in(driver)
         logger.info(f"[Google] вход по cookies: {'да' if logged else 'нет'}")
         if not logged:
-            shot(driver, "🔍 Google: cookies не подошли (устарели?)")
+            shot(driver, "🔍 Google: cookies не подошли — иду по почте/паролю")
         return logged
     except Exception as e:
         logger.error(f"[Google] ошибка cookies: {type(e).__name__}")
@@ -393,14 +498,14 @@ def login_with_cookies(driver):
 
 
 def login_google(driver, inbox):
-    """Вход в Google. Сначала cookies, потом почта и пароль. True, если вошли."""
+    """Полный fallback-конвейер. True — вошли."""
     if login_with_cookies(driver):
         return True
 
     email = os.getenv("GOOGLE_EMAIL", "").strip()
     password = os.getenv("GOOGLE_PASSWORD", "")
     if not email or not password:
-        logger.warning("GOOGLE_EMAIL / GOOGLE_PASSWORD не заданы — зайдём как гость")
+        logger.warning("GOOGLE_EMAIL/GOOGLE_PASSWORD не заданы — захожу гостем")
         return False
 
     try:
@@ -408,20 +513,37 @@ def login_google(driver, inbox):
             "https://accounts.google.com/signin/v2/identifier"
             "?hl=en&flowName=GlifWebSignIn&flowEntry=ServiceLogin"
         )
-        if not exists_any(driver, EMAIL_XP, timeout=20):
-            shot(driver, "🔍 Google: нет поля почты")
-            return False
-        box = find_visible(driver, EMAIL_XP)
-        box.click()
-        box.send_keys(email)
-        box.send_keys(Keys.ENTER)
-        time.sleep(3)
-        if not solve_captcha(driver, inbox):
-            return False
+        time.sleep(2)
 
+        # 1) chooser «Choose an account» (часто после слёта cookies)
+        if not click_profile_if_chooser(driver, email):
+            # 2) обычный ввод email
+            if exists_any(driver, EMAIL_XP, timeout=20):
+                box = find_visible(driver, EMAIL_XP)
+                box.click()
+                box.send_keys(email)
+                box.send_keys(Keys.ENTER)
+                time.sleep(3)
+                if not solve_captcha(driver, inbox):
+                    return False
+                # 3) после email иногда снова chooser
+                click_profile_if_chooser(driver, email)
+            else:
+                click_through_generic(driver)
+                if exists_any(driver, EMAIL_XP, timeout=5):
+                    box = find_visible(driver, EMAIL_XP)
+                    box.click()
+                    box.send_keys(email)
+                    box.send_keys(Keys.ENTER)
+                    time.sleep(3)
+                    solve_captcha(driver, inbox)
+
+        # пароль (после клика по плашке Google почти всегда просит пароль)
         if not exists_any(driver, PASS_XP, timeout=25):
             logger.info(f"[Google] нет поля пароля, url: {driver.current_url}")
-            shot(driver, f"🔍 Google: после почты нет пароля ({driver.current_url[:120]})")
+            click_through_generic(driver)
+        if not exists_any(driver, PASS_XP, timeout=5):
+            shot(driver, f"🔍 Google: после почты нет пароля ({driver.current_url[:100]})")
             return False
         time.sleep(1.5)
         box = find_visible(driver, PASS_XP)
@@ -435,27 +557,40 @@ def login_google(driver, inbox):
 
         url = driver.current_url
         logger.info(f"[Google] после пароля url: {url}")
+
+        # 2FA / «Verify it's you» — число парсим и шлём
         if "challenge" in url:
-            # «Verify it's you» — подтверждение на телефоне, ждём
-            shot(driver, "📱 Google просит подтвердить вход. Открой телефон, нажми Да и выбери число с картинки (4 мин)")
+            time.sleep(2)
+            num = extract_2fa_number(driver)
+            if num:
+                cap = (f"📱 <b>Google 2FA</b>\nПодтверди вход на телефоне. "
+                       f"Нажми число: <b>{num}</b>\n(жду 4 мин)")
+            else:
+                cap = ("📱 <b>Google 2FA</b>\nОткрой телефон и подтверди вход "
+                       "(«Да» + число с экрана).\n(жду 4 мин)")
+            shot(driver, cap)
             end = time.time() + 240
             while time.time() < end and "challenge" in driver.current_url:
                 time.sleep(3)
             url = driver.current_url
-            logger.info(f"[Google] после подтверждения url: {url}")
+            logger.info(f"[Google] после 2FA url: {url}")
             if "challenge" in url:
-                shot(driver, f"🔍 Подтверждение не дождался ({url[:120]})")
+                shot(driver, f"🔍 2FA не подтвердили ({url[:100]})")
                 return False
             time.sleep(3)
+
+        # неизвестные экраны (условия, подтверждения и т.п.) — прокликиваем
+        click_through_generic(driver)
+
         if any(x in url for x in ("rejected", "deniedsigninrejected")) \
                 or "accounts.google.com/signin" in url:
-            shot(driver, f"🔍 Google не пустил ({url[:120]})")
+            shot(driver, f"🔍 Google не пустил ({url[:100]})")
             return False
 
         logged = is_logged_in(driver)
-        logger.info(f"[Google] вход: {'да' if logged else 'нет'}, url: {driver.current_url}")
+        logger.info(f"[Google] вход: {'да' if logged else 'нет'}")
         if not logged:
-            shot(driver, f"🔍 Google: вход не подтвердился ({driver.current_url[:120]})")
+            shot(driver, f"🔍 Google: вход не подтвердился ({driver.current_url[:100]})")
         return logged
     except Exception as e:
         logger.error(f"[Google] ошибка входа: {type(e).__name__}")
@@ -465,12 +600,17 @@ def login_google(driver, inbox):
 
 # ======================= GOOGLE MEET =======================
 MIC_OFF = [
-    "//*[@role='button' and (contains(@aria-label,'Turn off microphone') or contains(@aria-label,'Отключить микрофон') or contains(@aria-label,'Вимкнути мікрофон'))]",
+    "//*[@role='button' and (contains(@aria-label,'Turn off microphone')"
+    " or contains(@aria-label,'Отключить микрофон')"
+    " or contains(@aria-label,'Вимкнути мікрофон'))]",
 ]
 CAM_OFF = [
-    "//*[@role='button' and (contains(@aria-label,'Turn off camera') or contains(@aria-label,'Отключить камеру') or contains(@aria-label,'Вимкнути камеру'))]",
+    "//*[@role='button' and (contains(@aria-label,'Turn off camera')"
+    " or contains(@aria-label,'Отключить камеру')"
+    " or contains(@aria-label,'Вимкнути камеру'))]",
 ]
-NAME_INPUT = "//input[@placeholder='Your name' or contains(@placeholder,'ім') or contains(@placeholder,'Ваше имя')]"
+NAME_INPUT = ("//input[@placeholder='Your name' or contains(@placeholder,'ім')"
+              " or contains(@placeholder,'Ваше имя') or contains(@placeholder,'имя')]")
 DISMISS_POPUP = [
     "//span[contains(text(),'Не сейчас')]",
     "//span[contains(text(),'Не зараз')]",
@@ -483,7 +623,6 @@ MEET_JOIN = [
     "//span[contains(text(),'Приєднатися')]",
     "//span[contains(text(),'Попросить')]",
     "//span[contains(text(),'Попроситися')]",
-    "//span[contains(text(),'Запросити')]",
 ]
 MEET_IN_CALL = [
     "//*[contains(@aria-label,'Leave call')]",
@@ -494,21 +633,20 @@ MEET_IN_CALL = [
 
 
 def join_meet(ctx):
-    """Возвращает 'ok' / 'fail' / 'rejoin' / 'leave'."""
     m, driver, subject = ctx.m, ctx.driver, ctx.subject
     url = m["url"]
     if "hl=" not in url:
         url += ("&" if "?" in url else "?") + "hl=en"
     driver.get(url)
     if not exists_any(driver, MEET_JOIN, timeout=45):
-        shot(driver, f"⚠️ <b>Meet</b>: нет кнопки входа в «{subject}»", ctx.btn("rejoin", "leave"))
+        shot(driver, f"⚠️ <b>Meet</b>: нет кнопки входа в «{subject}»",
+             ctx.btn("rejoin", "leave"))
         return "fail"
 
-    click_any(driver, DISMISS_POPUP, timeout=3)   # окно «Получать уведомления»
-    click_any(driver, MIC_OFF, timeout=3)         # микрофон и камера выключены
+    click_any(driver, DISMISS_POPUP, timeout=3)
+    click_any(driver, MIC_OFF, timeout=3)
     click_any(driver, CAM_OFF, timeout=3)
 
-    # гостевой вход — нужно имя
     try:
         for el in driver.find_elements(By.XPATH, NAME_INPUT):
             if el.is_displayed():
@@ -518,12 +656,14 @@ def join_meet(ctx):
         pass
 
     if not click_any(driver, MEET_JOIN, timeout=5):
-        shot(driver, f"⚠️ <b>Meet</b>: не нажалась кнопка входа в «{subject}»", ctx.btn("rejoin", "leave"))
+        shot(driver, f"⚠️ <b>Meet</b>: не нажалась кнопка входа в «{subject}»",
+             ctx.btn("rejoin", "leave"))
         return "fail"
     logger.info("[Meet] запрос на вход отправлен")
 
-    send_telegram(f"⏳ <b>Meet</b>: в очереди на вход в «{subject}»", ctx.btn("shot", "rejoin", "leave"))
-    return wait_admit(ctx, f"⚠️ <b>Meet</b>: так и не впустили в «{subject}» до конца пары")
+    send_telegram(f"⏳ <b>Meet</b>: в очереди на вход в «{subject}»",
+                  ctx.btn("shot", "rejoin", "leave"))
+    return wait_admit(ctx, f"⚠️ <b>Meet</b>: так и не впустили в «{subject}»")
 
 
 # ======================= ZOOM =======================
@@ -531,11 +671,11 @@ ZOOM_IN_CALL = [
     "//*[contains(@class,'footer__leave-btn')]",
     "//button[contains(@aria-label,'Leave')]",
     "//button[contains(@aria-label,'Покинути')]",
+    "//button[contains(@aria-label,'Покинуть')]",
 ]
 
 
 def join_zoom(ctx):
-    """Возвращает 'ok' / 'fail' / 'rejoin' / 'leave'."""
     m, driver, subject = ctx.m, ctx.driver, ctx.subject
     meeting_id = str(m["meeting_id"]).replace(" ", "")
     url = f"https://zoom.us/wc/join/{meeting_id}"
@@ -548,7 +688,8 @@ def join_zoom(ctx):
     click_any(driver, ["//button[@id='wc_agree1']"], timeout=2)
 
     if not exists_any(driver, ["//input[@id='input-for-name']"], timeout=30):
-        shot(driver, f"⚠️ <b>Zoom</b>: нет поля имени в «{subject}»", ctx.btn("rejoin", "leave"))
+        shot(driver, f"⚠️ <b>Zoom</b>: нет поля имени в «{subject}»",
+             ctx.btn("rejoin", "leave"))
         return "fail"
     name = driver.find_element(By.ID, "input-for-name")
     name.clear()
@@ -556,19 +697,20 @@ def join_zoom(ctx):
 
     if not click_any(
         driver,
-        [
-            "//button[contains(@class,'preview-join-button')]",
-            "//button[contains(text(),'Join')]",
-            "//button[contains(text(),'Приєднатися')]",
-        ],
+        ["//button[contains(@class,'preview-join-button')]",
+         "//button[contains(text(),'Join')]",
+         "//button[contains(text(),'Приєднатися')]",
+         "//button[contains(text(),'Присоедин')]"],
         timeout=15,
     ):
-        shot(driver, f"⚠️ <b>Zoom</b>: нет кнопки Join в «{subject}»", ctx.btn("rejoin", "leave"))
+        shot(driver, f"⚠️ <b>Zoom</b>: нет кнопки Join в «{subject}»",
+             ctx.btn("rejoin", "leave"))
         return "fail"
     logger.info("[Zoom] запрос на вход отправлен")
 
-    send_telegram(f"⏳ <b>Zoom</b>: в очереди на вход в «{subject}»", ctx.btn("shot", "rejoin", "leave"))
-    return wait_admit(ctx, f"⚠️ <b>Zoom</b>: так и не вошли в «{subject}» до конца пары")
+    send_telegram(f"⏳ <b>Zoom</b>: в очереди на вход в «{subject}»",
+                  ctx.btn("shot", "rejoin", "leave"))
+    return wait_admit(ctx, f"⚠️ <b>Zoom</b>: так и не вошли в «{subject}»")
 
 
 # ======================= ПРОЦЕСС ОДНОЙ ПАРЫ =======================
@@ -581,14 +723,15 @@ def detect_reason(driver):
         return "похоже, вас удалили из встречи"
     if any(k in text for k in ("ended", "завершен", "завершил", "завершено", "закінчен")):
         return "похоже, встреча завершена"
-    if any(k in text for k in ("rejoin", "вернуться", "повернутися", "return to home", "главный экран", "головний екран")):
+    if any(k in text for k in ("rejoin", "вернуться", "повернутися",
+                               "return to home", "главный экран", "головний екран")):
         return "вы вышли из встречи"
     return "причина неизвестна"
 
 
 def monitor_meeting(ctx):
-    """Сидит до конца пары, следит что мы в звонке и слушает кнопки.
-    Возвращает 'done' / 'kicked' / 'rejoin' / 'leave'."""
+    """Сидит до конца пары. При вылете — автоперезаход (до AUTO_REJOIN раз),
+    потом кнопки. Возвращает 'done' / 'kicked' / 'rejoin' / 'leave'."""
     in_call = ctx.in_call_xp()
     misses = 0
     while True:
@@ -602,13 +745,23 @@ def monitor_meeting(ctx):
             return "done"
         ok = present_any(ctx.driver, in_call)
         misses = 0 if ok else misses + 1
-        if misses >= 2:  # две проверки подряд, чтобы не реагировать на мигание интерфейса
+        if misses >= 2:
             reason = detect_reason(ctx.driver)
             try:
                 logger.info(f"[{ctx.platform}] url при выходе: {ctx.driver.current_url}")
             except Exception:
                 pass
             logger.warning(f"[{ctx.platform}] вылетели из «{ctx.subject}»: {reason}")
+            if ctx.rejoins < AUTO_REJOIN and "заверш" not in reason \
+                    and "ended" not in reason:
+                ctx.rejoins += 1
+                send_telegram(
+                    f"🔄 <b>{ctx.platform}</b>: вылет из «{ctx.subject}» ({reason}).\n"
+                    f"Автоперезаход {ctx.rejoins}/{AUTO_REJOIN}…",
+                    ctx.btn("shot", "leave"),
+                )
+                time.sleep(15)
+                return "autorejoin"
             shot(
                 ctx.driver,
                 f"🚫 <b>{ctx.platform}</b>: вышло из «{ctx.subject}» до конца пары\n{reason}",
@@ -617,7 +770,17 @@ def monitor_meeting(ctx):
             return "kicked"
 
 
-def wait_for_start(m):
+def wait_for_prep(m):
+    """Спим до момента PREP_LEAD до начала пары (браузер+логин)."""
+    s = start_dt(m, datetime.now(KYIV)) - PREP_LEAD
+    left = (s - datetime.now(KYIV)).total_seconds()
+    if left > 0:
+        logger.info(f"Ждём момента подготовки: {left:.0f} сек")
+        time.sleep(left)
+
+
+def wait_for_join(m):
+    """Спим до момента JOIN_LEAD до начала пары (клик по Join)."""
     s = start_dt(m, datetime.now(KYIV)) - JOIN_LEAD
     left = (s - datetime.now(KYIV)).total_seconds()
     if left > 0:
@@ -635,19 +798,27 @@ def run_meeting(m, idx, inbox, test=False):
         logger.warning(f"Неизвестная платформа: {platform}")
         return
 
-    final = None  # 'finished' / 'left'
+    final = None
     try:
         if not test:
-            wait_for_start(m)
+            wait_for_prep(m)
         ctx.driver = make_driver()
+        send_telegram(
+            f"🤖 <b>{platform}</b>: готовлюсь к «{subject}» "
+            f"(пара {m['start_time']}–{m['end_time']})"
+        )
 
         if platform == "google_meet" and not login_google(ctx.driver, inbox):
             send_telegram("⚠️ Google: вход не подтвердился, захожу гостем")
+
+        if not test:
+            wait_for_join(m)
 
         while seconds_left(m) > 0:
             res = join_meet(ctx) if platform == "google_meet" else join_zoom(ctx)
 
             if res == "ok":
+                ctx.rejoins = 0
                 shot(
                     ctx.driver,
                     f"✅ <b>{platform}</b>: на паре «{subject}»\n⏰ до {m['end_time']}",
@@ -661,11 +832,12 @@ def run_meeting(m, idx, inbox, test=False):
             if res == "leave":
                 final = "left"
                 break
-            if res == "rejoin":
-                send_telegram("🔄 Перезахожу…")
+            if res in ("rejoin", "autorejoin"):
+                if res == "rejoin":
+                    send_telegram("🔄 Перезахожу…")
                 continue
 
-            # 'fail' или 'kicked': держим браузер и ждём кнопку до конца пары
+            # 'fail' или 'kicked': ждём кнопку до конца пары
             act = wait_cmd(ctx, max(0, seconds_left(m)))
             if act == "rejoin":
                 send_telegram("🔄 Перезахожу…")
@@ -676,7 +848,8 @@ def run_meeting(m, idx, inbox, test=False):
     except Exception as e:
         logger.error(f"Ошибка ({label}): {type(e).__name__}")
         if ctx.driver:
-            shot(ctx.driver, f"❌ Ошибка в «{subject}»: {type(e).__name__}", ctx.btn("shot"))
+            shot(ctx.driver, f"❌ Ошибка в «{subject}»: {type(e).__name__}",
+                 ctx.btn("shot"))
     finally:
         if ctx.driver:
             try:
@@ -702,11 +875,11 @@ def main():
     force_url = os.getenv("FORCE_URL", "").strip()
 
     def force_end():
-        # не переходим через полночь: end_dt считает время в рамках текущей даты
-        return min(now + FORCE_LEN, now.replace(hour=23, minute=59, second=0, microsecond=0))
+        return min(now + FORCE_LEN,
+                   now.replace(hour=23, minute=59, second=0, microsecond=0))
 
     if force_url:
-        due = [{
+        due = [(0, {
             "platform": "google_meet",
             "subject": "Ссылка из меню",
             "url": force_url,
@@ -714,20 +887,21 @@ def main():
             "start_time": now.strftime("%H:%M"),
             "end_time": force_end().strftime("%H:%M"),
             "display_name": "Student",
-        }]
+        })]
         test = True
     elif force_idx:
-        m = dict(meetings[int(force_idx)])
+        i = int(force_idx)
+        m = dict(meetings[i])
         end = end_dt(m, now)
-        if end <= now + timedelta(minutes=10):  # пара уже закончилась или вот-вот закончится
+        if end <= now + timedelta(minutes=10):
             end = force_end()
         m["day"] = DAYS[now.weekday()]
         m["start_time"] = now.strftime("%H:%M")
         m["end_time"] = end.strftime("%H:%M")
-        due = [m]
+        due = [(i, m)]
         test = True
     elif test_url:
-        due = [{
+        due = [(0, {
             "platform": "google_meet",
             "subject": "Тест",
             "url": test_url,
@@ -735,12 +909,13 @@ def main():
             "start_time": now.strftime("%H:%M"),
             "end_time": (now + timedelta(minutes=5)).strftime("%H:%M"),
             "display_name": "Test",
-        }]
+        })]
         test = True
     elif test_idx:
-        m = dict(meetings[int(test_idx)])
+        i = int(test_idx)
+        m = dict(meetings[i])
         m["end_time"] = (now + timedelta(minutes=3)).strftime("%H:%M")
-        due = [m]
+        due = [(i, m)]
         test = True
     else:
         due = pick_due(meetings, now)
@@ -749,19 +924,24 @@ def main():
         logger.info(f"Сейчас ({now:%a %H:%M} Киев) подходящих пар нет — выходим")
         return
 
-    # id запуска: кнопки от прошлых запусков будут отвечать «неактуально»
+    # RUN_ID выставляем ДО spawn — env наследуется дочерними процессами
     run_id = str(int(time.time()) % 1000000)
     os.environ["RUN_ID"] = run_id
     offset = get_update_offset() or 0
 
+    send_telegram(
+        f"🤖 Запуск бота (run {run_id}): {len(due)} "
+        f"пар(ы) — {', '.join(m.get('subject', '?') for _, m in due)}"
+    )
+
     ctx = multiprocessing.get_context("spawn")
     queues = [ctx.Queue() for _ in due]
-    procs = [ctx.Process(target=run_meeting, args=(m, i, queues[i], test))
-             for i, m in enumerate(due)]
+    procs = [ctx.Process(target=run_meeting, args=(m, i, queues[k], test))
+             for k, (i, m) in enumerate(due)]
     for p in procs:
         p.start()
 
-    # Главный процесс — единственный, кто читает Telegram, и раздаёт события по парам
+    # Главный процесс — единственный читает Telegram и раздаёт события
     while any(p.is_alive() for p in procs):
         events, offset = get_updates(offset, timeout=8)
         for kind, cid, val in events:
@@ -784,6 +964,7 @@ def main():
 
     for p in procs:
         p.join()
+    send_telegram("🏁 Запуск завершён, браузер закрыт")
 
 
 if __name__ == "__main__":

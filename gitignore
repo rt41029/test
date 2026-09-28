@@ -1,0 +1,6 @@
+schedule.json
+*.env
+.env
+cookies.json
+*.log
+__pycache__/

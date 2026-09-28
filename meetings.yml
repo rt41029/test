@@ -1,0 +1,52 @@
+name: meetings
+
+on:
+  schedule:
+    # Cron работает в UTC. Ниже расписание для ЛЕТНЕГО времени Киева (UTC+3),
+    # каждый запуск за ~15 минут до начала пары (07:59, 09:34, 11:24, 13:00 по Киеву).
+    # Летнее время в Украине заканчивается 25.10.2026 — тогда закомментируйте
+    # блок "ЛЕТО" и раскройте блок "ЗИМА" (UTC+2, всё сдвигается на час позже).
+    # --- ЛЕТО ---
+    - cron: "44 4 * * 1-5"
+    - cron: "19 6 * * 1-5"
+    - cron: "9 8 * * 1-5"
+    - cron: "45 9 * * 1-5"
+    # --- ЗИМА ---
+    # - cron: "44 5 * * 1-5"
+    # - cron: "19 7 * * 1-5"
+    # - cron: "9 9 * * 1-5"
+    # - cron: "45 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: "Проверка: ссылка на Google Meet. Зайдёт на 5 минут. Пусто = обычный режим"
+        required: false
+        default: ""
+      test_index:
+        description: "Проверка: номер пары в schedule.json (с 0). Зайдёт на 3 минуты. Пусто = обычный режим"
+        required: false
+        default: ""
+
+jobs:
+  join:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install selenium requests
+
+      - name: Run bot
+        env:
+          GOOGLE_COOKIES: ${{ secrets.GOOGLE_COOKIES }}
+          SCHEDULE_JSON: ${{ secrets.SCHEDULE_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_INDEX: ${{ github.event.inputs.test_index }}
+          TEST_URL: ${{ github.event.inputs.test_url }}
+        run: python bot.py

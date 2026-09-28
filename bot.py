@@ -1,0 +1,382 @@
+"""
+Бот для GitHub Actions.
+Запускается по cron, смотрит расписание (Киев), заходит на пары, которые
+начинаются в ближайшие 15 минут или начались не более 25 минут назад,
+и сидит до конца пары. Вход в Google — через cookies из секрета GOOGLE_COOKIES.
+
+Переменные окружения (Secrets):
+  GOOGLE_COOKIES      JSON-экспорт cookies (Cookie-Editor)
+  SCHEDULE_JSON       содержимое schedule.json (если нет локального файла)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  TEST_INDEX          (необязательно) номер пары в списке — зайти на неё прямо
+                      сейчас на 3 минуты, для проверки
+"""
+import json
+import os
+import sys
+import time
+import logging
+import multiprocessing
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+from notifier import send_telegram, send_photo
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger("bot")
+
+try:
+    KYIV = ZoneInfo("Europe/Kyiv")
+except Exception:
+    KYIV = ZoneInfo("Europe/Kiev")
+
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+EARLY = timedelta(minutes=15)   # за сколько до начала можно заходить
+LATE = timedelta(minutes=25)    # насколько можно опоздать (cron в Actions бывает с задержкой)
+JOIN_LEAD = timedelta(minutes=7)  # за сколько до начала вставать в очередь на вход
+
+
+# ======================= РАСПИСАНИЕ =======================
+def load_schedule():
+    raw = os.getenv("SCHEDULE_JSON")
+    if raw:
+        return json.loads(raw)
+    with open("schedule.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def start_dt(m, now):
+    h, mi = map(int, m["start_time"].split(":"))
+    return now.replace(hour=h, minute=mi, second=0, microsecond=0)
+
+
+def end_dt(m, now):
+    h, mi = map(int, m["end_time"].split(":"))
+    return now.replace(hour=h, minute=mi, second=0, microsecond=0)
+
+
+def admit_timeout(m):
+    """Сколько секунд ждать, пока впустят: до конца пары (минимум минута)."""
+    left = (end_dt(m, datetime.now(KYIV)) - datetime.now(KYIV)).total_seconds()
+    return max(60, left)
+
+
+def pick_due(meetings, now):
+    today = DAYS[now.weekday()]
+    due = []
+    for m in meetings:
+        if m.get("day", "").lower() != today:
+            continue
+        s = start_dt(m, now)
+        if s - EARLY <= now <= s + LATE and now < end_dt(m, now):
+            due.append(m)
+    return due
+
+
+# ======================= БРАУЗЕР =======================
+def make_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=en-US")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # автоматически разрешает доступ к микро/камере (фейковые устройства)
+    opts.add_argument("--use-fake-ui-for-media-stream")
+    opts.add_argument("--use-fake-device-for-media-stream")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+def click_any(driver, xpaths, timeout=0):
+    end = time.time() + timeout
+    while True:
+        for xp in xpaths:
+            try:
+                for el in driver.find_elements(By.XPATH, xp):
+                    if el.is_displayed():
+                        el.click()
+                        return True
+            except Exception:
+                pass
+        if time.time() >= end:
+            return False
+        time.sleep(0.5)
+
+
+def exists_any(driver, xpaths, timeout=0):
+    end = time.time() + timeout
+    while True:
+        for xp in xpaths:
+            try:
+                if any(e.is_displayed() for e in driver.find_elements(By.XPATH, xp)):
+                    return True
+            except Exception:
+                pass
+        if time.time() >= end:
+            return False
+        time.sleep(1)
+
+
+def shot(driver, caption):
+    try:
+        send_photo(driver.get_screenshot_as_png(), caption)
+    except Exception:
+        pass
+
+
+# ======================= ВХОД В GOOGLE =======================
+def login_google(driver):
+    """Подставляет cookies из GOOGLE_COOKIES. Возвращает True, если вход виден."""
+    raw = os.getenv("GOOGLE_COOKIES")
+    if not raw:
+        logger.warning("GOOGLE_COOKIES не задан — зайдём как гость")
+        return False
+
+    cookies = json.loads(raw)
+    samesite = {"no_restriction": "None", "lax": "Lax", "strict": "Strict"}
+
+    driver.get("https://accounts.google.com/")
+    added = 0
+    for c in cookies:
+        domain = c.get("domain", "")
+        if not domain.endswith("google.com"):
+            continue
+        d = {
+            "name": c["name"],
+            "value": c["value"],
+            "path": c.get("path", "/"),
+            "domain": domain,
+            "secure": bool(c.get("secure", True)),
+        }
+        if c.get("httpOnly"):
+            d["httpOnly"] = True
+        if "expirationDate" in c:
+            d["expiry"] = int(c["expirationDate"])
+        ss = samesite.get(str(c.get("sameSite", "")).lower())
+        if ss:
+            d["sameSite"] = ss
+            if ss == "None":
+                d["secure"] = True
+        try:
+            driver.add_cookie(d)
+            added += 1
+        except Exception:
+            continue
+
+    driver.get("https://accounts.google.com/")
+    time.sleep(3)
+    logged = "myaccount.google.com" in driver.current_url
+    logger.info(f"[Google] cookies добавлено: {added}, вход: {'да' if logged else 'нет'}")
+    return logged
+
+
+# ======================= GOOGLE MEET =======================
+MIC_OFF = [
+    "//*[@role='button' and (contains(@aria-label,'Turn off microphone') or contains(@aria-label,'Вимкнути мікрофон'))]",
+]
+CAM_OFF = [
+    "//*[@role='button' and (contains(@aria-label,'Turn off camera') or contains(@aria-label,'Вимкнути камеру'))]",
+]
+NAME_INPUT = "//input[@placeholder='Your name' or contains(@placeholder,'ім')]"
+MEET_JOIN = [
+    "//span[contains(text(),'Join now')]",
+    "//span[contains(text(),'Ask to join')]",
+    "//span[contains(text(),'Приєднатися')]",
+    "//span[contains(text(),'Попросити')]",
+    "//span[contains(text(),'Запросити')]",
+]
+MEET_IN_CALL = [
+    "//*[contains(@aria-label,'Leave call')]",
+    "//*[contains(@aria-label,'Покинути')]",
+    "//*[contains(@aria-label,'Вийти')]",
+]
+
+
+def join_meet(m, driver, subject):
+    driver.get(m["url"])
+    if not exists_any(driver, MEET_JOIN, timeout=45):
+        shot(driver, f"⚠️ <b>Meet</b>: нет кнопки входа в «{subject}»")
+        return False
+
+    click_any(driver, MIC_OFF, timeout=3)
+    click_any(driver, CAM_OFF, timeout=3)
+
+    # гостевой вход — нужно имя
+    try:
+        for el in driver.find_elements(By.XPATH, NAME_INPUT):
+            if el.is_displayed():
+                el.clear()
+                el.send_keys(m.get("display_name", "Student"))
+    except Exception:
+        pass
+
+    if not click_any(driver, MEET_JOIN, timeout=5):
+        shot(driver, f"⚠️ <b>Meet</b>: не нажалась кнопка входа в «{subject}»")
+        return False
+    logger.info("[Meet] запрос на вход отправлен")
+
+    send_telegram(f"⏳ <b>Meet</b>: в очереди на вход в «{subject}»")
+    if exists_any(driver, MEET_IN_CALL, timeout=admit_timeout(m)):
+        return True
+    shot(driver, f"⚠️ <b>Meet</b>: так и не впустили в «{subject}» до конца пары")
+    return False
+
+
+# ======================= ZOOM =======================
+ZOOM_IN_CALL = [
+    "//*[contains(@class,'footer__leave-btn')]",
+    "//button[contains(@aria-label,'Leave')]",
+    "//button[contains(@aria-label,'Покинути')]",
+]
+
+
+def join_zoom(m, driver, subject):
+    meeting_id = str(m["meeting_id"]).replace(" ", "")
+    url = f"https://zoom.us/wc/join/{meeting_id}"
+    if m.get("password"):
+        url += f"?pwd={m['password']}"
+    driver.get(url)
+    time.sleep(6)
+
+    click_any(driver, ["//button[@id='onetrust-accept-btn-handler']"], timeout=3)
+    click_any(driver, ["//button[@id='wc_agree1']"], timeout=2)
+
+    if not exists_any(driver, ["//input[@id='input-for-name']"], timeout=30):
+        shot(driver, f"⚠️ <b>Zoom</b>: нет поля имени в «{subject}»")
+        return False
+    name = driver.find_element(By.ID, "input-for-name")
+    name.clear()
+    name.send_keys(m.get("display_name", "Student"))
+
+    if not click_any(
+        driver,
+        [
+            "//button[contains(@class,'preview-join-button')]",
+            "//button[contains(text(),'Join')]",
+            "//button[contains(text(),'Приєднатися')]",
+        ],
+        timeout=15,
+    ):
+        shot(driver, f"⚠️ <b>Zoom</b>: нет кнопки Join в «{subject}»")
+        return False
+    logger.info("[Zoom] запрос на вход отправлен")
+
+    send_telegram(f"⏳ <b>Zoom</b>: в очереди на вход в «{subject}»")
+    if exists_any(driver, ZOOM_IN_CALL, timeout=admit_timeout(m)):
+        return True
+    shot(driver, f"⚠️ <b>Zoom</b>: так и не вошли в «{subject}» до конца пары")
+    return False
+
+
+# ======================= ПРОЦЕСС ОДНОЙ ПАРЫ =======================
+def stay_until_end(m):
+    end = end_dt(m, datetime.now(KYIV))
+    while True:
+        left = (end - datetime.now(KYIV)).total_seconds()
+        if left <= 0:
+            return
+        time.sleep(min(30, left))
+
+
+def wait_for_start(m):
+    s = start_dt(m, datetime.now(KYIV)) - JOIN_LEAD
+    left = (s - datetime.now(KYIV)).total_seconds()
+    if left > 0:
+        logger.info(f"Ждём момента входа: {left:.0f} сек")
+        time.sleep(left)
+
+
+def run_meeting(m, test=False):
+    subject = m.get("subject", "без названия")
+    platform = m["platform"]
+    label = f"{platform} {m.get('day')} {m.get('start_time')}"
+    logger.info(f"Старт: {label}")
+
+    driver = None
+    joined = False
+    try:
+        if not test:
+            wait_for_start(m)
+        driver = make_driver()
+
+        if platform == "google_meet":
+            if not login_google(driver):
+                send_telegram("⚠️ Google: вход по cookies не подтвердился, захожу гостем")
+            joined = join_meet(m, driver, subject)
+        elif platform == "zoom":
+            joined = join_zoom(m, driver, subject)
+        else:
+            logger.warning(f"Неизвестная платформа: {platform}")
+            return
+
+        if joined:
+            send_telegram(f"✅ <b>{platform}</b>: на паре «{subject}»\n⏰ до {m['end_time']}")
+            stay_until_end(m)
+    except Exception as e:
+        logger.error(f"Ошибка ({label}): {type(e).__name__}")
+        if driver:
+            shot(driver, f"❌ Ошибка в «{subject}»: {type(e).__name__}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if joined:
+            send_telegram(f"🚪 <b>{platform}</b>: вышел из «{subject}»")
+        logger.info(f"Завершено: {label}")
+
+
+# ======================= MAIN =======================
+def main():
+    meetings = load_schedule()
+    now = datetime.now(KYIV)
+    test = False
+
+    test_idx = os.getenv("TEST_INDEX", "").strip()
+    test_url = os.getenv("TEST_URL", "").strip()
+    if test_url:
+        due = [{
+            "platform": "google_meet",
+            "subject": "Тест",
+            "url": test_url,
+            "day": DAYS[now.weekday()],
+            "start_time": now.strftime("%H:%M"),
+            "end_time": (now + timedelta(minutes=5)).strftime("%H:%M"),
+            "display_name": "Test",
+        }]
+        test = True
+    elif test_idx:
+        m = dict(meetings[int(test_idx)])
+        m["end_time"] = (now + timedelta(minutes=3)).strftime("%H:%M")
+        due = [m]
+        test = True
+    else:
+        due = pick_due(meetings, now)
+
+    if not due:
+        logger.info(f"Сейчас ({now:%a %H:%M} Киев) подходящих пар нет — выходим")
+        return
+
+    ctx = multiprocessing.get_context("spawn")
+    procs = [ctx.Process(target=run_meeting, args=(m, test)) for m in due]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+
+
+if __name__ == "__main__":
+    main()

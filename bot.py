@@ -2,10 +2,11 @@
 Бот для GitHub Actions.
 Запускается по cron, смотрит расписание (Киев), заходит на пары, которые
 начинаются в ближайшие 20 минут или начались не более 25 минут назад,
-и сидит до конца пары. Вход в Google — через cookies из секрета GOOGLE_COOKIES.
+и сидит до конца пары. Вход в Google — по почте и паролю из секретов.
 
 Переменные окружения (Secrets):
-  GOOGLE_COOKIES      JSON-экспорт cookies (Cookie-Editor)
+  GOOGLE_EMAIL        почта Google-аккаунта
+  GOOGLE_PASSWORD     пароль Google-аккаунта
   SCHEDULE_JSON       содержимое schedule.json (если нет локального файла)
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   TEST_INDEX          (необязательно) номер пары в списке — зайти на неё прямо
@@ -24,6 +25,7 @@ from zoneinfo import ZoneInfo
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from notifier import send_telegram, send_photo
 
@@ -145,58 +147,52 @@ def shot(driver, caption):
 
 # ======================= ВХОД В GOOGLE =======================
 def login_google(driver):
-    """Подставляет cookies из GOOGLE_COOKIES. Возвращает True, если вход виден."""
-    raw = os.getenv("GOOGLE_COOKIES")
-    if not raw:
-        logger.warning("GOOGLE_COOKIES не задан — зайдём как гость")
+    """Вход по почте и паролю из секретов. Возвращает True, если вход виден."""
+    email = os.getenv("GOOGLE_EMAIL", "").strip()
+    password = os.getenv("GOOGLE_PASSWORD", "")
+    if not email or not password:
+        logger.warning("GOOGLE_EMAIL / GOOGLE_PASSWORD не заданы — зайдём как гость")
         return False
 
-    cookies = json.loads(raw)
-    samesite = {"no_restriction": "None", "lax": "Lax", "strict": "Strict"}
+    try:
+        driver.get(
+            "https://accounts.google.com/signin/v2/identifier"
+            "?hl=en&flowName=GlifWebSignIn&flowEntry=ServiceLogin"
+        )
+        if not exists_any(driver, ["//input[@type='email']"], timeout=20):
+            shot(driver, "🔍 Google: нет поля почты")
+            return False
+        box = driver.find_element(By.XPATH, "//input[@type='email']")
+        box.send_keys(email)
+        box.send_keys(Keys.ENTER)
 
-    driver.get("https://accounts.google.com/")
-    added = 0
-    for c in cookies:
-        domain = c.get("domain", "")
-        if not domain.endswith("google.com"):
-            continue
-        d = {
-            "name": c["name"],
-            "value": c["value"],
-            "path": c.get("path", "/"),
-            "domain": domain,
-            "secure": bool(c.get("secure", True)),
-        }
-        if c.get("httpOnly"):
-            d["httpOnly"] = True
-        if "expirationDate" in c:
-            d["expiry"] = int(c["expirationDate"])
-        ss = samesite.get(str(c.get("sameSite", "")).lower())
-        if ss:
-            d["sameSite"] = ss
-            if ss == "None":
-                d["secure"] = True
-        try:
-            driver.add_cookie(d)
-            added += 1
-        except Exception:
-            continue
+        if not exists_any(driver, ["//input[@type='password']"], timeout=25):
+            logger.info(f"[Google] нет поля пароля, url: {driver.current_url}")
+            shot(driver, f"🔍 Google: после почты нет пароля ({driver.current_url[:120]})")
+            return False
+        time.sleep(1.5)
+        box = driver.find_element(By.XPATH, "//input[@type='password']")
+        box.send_keys(password)
+        box.send_keys(Keys.ENTER)
+        time.sleep(8)
 
-    driver.get("https://accounts.google.com/")
-    time.sleep(3)
-    logged = "myaccount.google.com" in driver.current_url
-    names = {c["name"] for c in cookies if c.get("domain", "").endswith("google.com")}
-    logger.info(
-        f"[Google] cookies добавлено: {added}, вход: {'да' if logged else 'нет'}, "
-        f"url: {driver.current_url}"
-    )
-    logger.info(
-        f"[Google] есть SID: {'SID' in names}, "
-        f"__Secure-1PSID: {'__Secure-1PSID' in names}, LSID: {'LSID' in names}"
-    )
-    if not logged:
-        shot(driver, f"🔍 Google после кук: {driver.current_url[:150]}")
-    return logged
+        url = driver.current_url
+        logger.info(f"[Google] после пароля url: {url}")
+        if any(x in url for x in ("challenge", "signin", "rejected", "deniedsigninrejected")):
+            shot(driver, f"🔍 Google не пустил ({url[:120]})")
+            return False
+
+        driver.get("https://myaccount.google.com/?hl=en")
+        time.sleep(3)
+        logged = "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url
+        logger.info(f"[Google] вход: {'да' if logged else 'нет'}, url: {driver.current_url}")
+        if not logged:
+            shot(driver, f"🔍 Google: вход не подтвердился ({driver.current_url[:120]})")
+        return logged
+    except Exception as e:
+        logger.error(f"[Google] ошибка входа: {type(e).__name__}")
+        shot(driver, f"🔍 Google: ошибка входа {type(e).__name__}")
+        return False
 
 
 # ======================= GOOGLE MEET =======================
@@ -330,7 +326,7 @@ def run_meeting(m, test=False):
 
         if platform == "google_meet":
             if not login_google(driver):
-                send_telegram("⚠️ Google: вход по cookies не подтвердился, захожу гостем")
+                send_telegram("⚠️ Google: вход по паролю не подтвердился, захожу гостем")
             joined = join_meet(m, driver, subject)
         elif platform == "zoom":
             joined = join_zoom(m, driver, subject)

@@ -221,6 +221,7 @@ def login_with_cookies(driver):
         driver.get("https://accounts.google.com/")
         time.sleep(2)
         added = 0
+        failed = []
         for c in cookies:
             cookie = {k: v for k, v in c.items()
                       if k in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry")}
@@ -234,8 +235,9 @@ def login_with_cookies(driver):
                 added += 1
             except Exception:
                 # cookie чужого домена (например .youtube.com) — пропускаем
-                pass
+                failed.append(f"{c.get('name')}@{c.get('domain')}")
         logger.info(f"[Google] cookies добавлено: {added}/{len(cookies)}")
+        logger.info(f"[Google] не добавлены (только имена): {failed}")
         logged = is_logged_in(driver)
         logger.info(f"[Google] вход по cookies: {'да' if logged else 'нет'}")
         if not logged:
@@ -470,6 +472,10 @@ def monitor_meeting(m, driver, platform, subject):
         misses = 0 if ok else misses + 1
         if misses >= 2:  # две проверки подряд, чтобы не реагировать на мигание интерфейса
             reason = detect_reason(driver)
+            try:
+                logger.info(f"[{platform}] url при выходе: {driver.current_url}")
+            except Exception:
+                pass
             logger.warning(f"[{platform}] вылетели из «{subject}»: {reason}")
             send_telegram(f"🚫 <b>{platform}</b>: вышло из «{subject}» до конца пары\n{reason}")
             shot(driver, f"📸 Экран в момент выхода («{subject}»)")

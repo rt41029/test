@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import requests
 
@@ -11,20 +12,35 @@ def _creds():
     return os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
 
 
-def send_telegram(message: str):
+def _markup(buttons):
+    """buttons: список рядов, ряд — список (текст, callback_data)."""
+    if not buttons:
+        return None
+    return json.dumps({
+        "inline_keyboard": [
+            [{"text": t, "callback_data": d} for t, d in row] for row in buttons
+        ]
+    })
+
+
+def send_telegram(message: str, buttons=None):
     token, chat_id = _creds()
     if not token or not chat_id:
         logger.warning("Telegram не настроен — пропускаю уведомление")
         return
+    data = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    mk = _markup(buttons)
+    if mk:
+        data["reply_markup"] = mk
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            data=data,
             timeout=15,
         )
         if r.status_code != 200:
@@ -33,15 +49,19 @@ def send_telegram(message: str):
         logger.warning(f"Не удалось отправить в Telegram: {type(e).__name__}")
 
 
-def send_photo(png_bytes: bytes, caption: str = ""):
-    """Скриншот в Telegram (для отладки, когда бот не смог зайти)."""
+def send_photo(png_bytes: bytes, caption: str = "", buttons=None):
+    """Скриншот в Telegram (опционально с кнопками под ним)."""
     token, chat_id = _creds()
     if not token or not chat_id:
         return
+    data = {"chat_id": chat_id, "caption": caption[:1000], "parse_mode": "HTML"}
+    mk = _markup(buttons)
+    if mk:
+        data["reply_markup"] = mk
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendPhoto",
-            data={"chat_id": chat_id, "caption": caption[:1000], "parse_mode": "HTML"},
+            data=data,
             files={"photo": ("screen.png", png_bytes)},
             timeout=30,
         )
@@ -49,8 +69,23 @@ def send_photo(png_bytes: bytes, caption: str = ""):
         logger.warning(f"Не удалось отправить фото: {type(e).__name__}")
 
 
+def answer_callback(callback_id: str, text: str = ""):
+    """Убирает «часики» на кнопке и показывает короткий тост."""
+    token, _ = _creds()
+    if not token:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            data={"callback_query_id": callback_id, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"answerCallbackQuery: {type(e).__name__}")
+
+
 def get_update_offset():
-    """Смещение, после которого идут только НОВЫЕ сообщения (вызывать до отправки капчи)."""
+    """Смещение, после которого идут только НОВЫЕ события."""
     token, _ = _creds()
     if not token:
         return None
@@ -67,25 +102,37 @@ def get_update_offset():
         return None
 
 
-def wait_for_reply(offset, timeout=180):
-    """Ждёт текстовое сообщение из вашего чата. Возвращает текст или None."""
+def get_updates(offset, timeout=8):
+    """Long-poll. Возвращает (события, новый_offset).
+    События только из вашего чата: ("cb", callback_id, data) или ("text", None, текст)."""
     token, chat_id = _creds()
-    if not token or not chat_id or offset is None:
-        return None
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{token}/getUpdates",
-                params={"offset": offset, "timeout": 10},
-                timeout=25,
-            ).json()
-            for upd in r.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                if str(msg.get("chat", {}).get("id")) == str(chat_id) and msg.get("text"):
-                    return msg["text"].strip()
-        except Exception as e:
-            logger.warning(f"wait_for_reply: {type(e).__name__}")
-            time.sleep(3)
-    return None
+    if not token or not chat_id:
+        time.sleep(timeout)
+        return [], offset
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={
+                "offset": offset,
+                "timeout": timeout,
+                "allowed_updates": json.dumps(["message", "callback_query"]),
+            },
+            timeout=timeout + 10,
+        ).json()
+    except Exception as e:
+        logger.warning(f"get_updates: {type(e).__name__}")
+        time.sleep(3)
+        return [], offset
+
+    events = []
+    for upd in r.get("result", []):
+        offset = upd["update_id"] + 1
+        cq = upd.get("callback_query")
+        if cq:
+            if str(cq.get("message", {}).get("chat", {}).get("id")) == str(chat_id):
+                events.append(("cb", cq["id"], cq.get("data", "")))
+            continue
+        msg = upd.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) == str(chat_id) and msg.get("text"):
+            events.append(("text", None, msg["text"].strip()))
+    return events, offset

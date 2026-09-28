@@ -1,3 +1,5 @@
+"""Обёртки Telegram Bot API. Читают TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+из окружения при каждом вызове (удобно для multiprocessing spawn)."""
 import os
 import time
 import json
@@ -8,12 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 def _creds():
-    # читаем переменные при вызове, а не при импорте
     return os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
 
 
 def _markup(buttons):
-    """buttons: список рядов, ряд — список (текст, callback_data)."""
     if not buttons:
         return None
     return json.dumps({
@@ -26,7 +26,7 @@ def _markup(buttons):
 def send_telegram(message: str, buttons=None):
     token, chat_id = _creds()
     if not token or not chat_id:
-        logger.warning("Telegram не настроен — пропускаю уведомление")
+        logger.warning("Telegram не настроен — пропускаю")
         return
     data = {
         "chat_id": chat_id,
@@ -40,17 +40,15 @@ def send_telegram(message: str, buttons=None):
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data=data,
-            timeout=15,
+            data=data, timeout=15,
         )
         if r.status_code != 200:
             logger.warning(f"Telegram вернул {r.status_code}")
     except Exception as e:
-        logger.warning(f"Не удалось отправить в Telegram: {type(e).__name__}")
+        logger.warning(f"sendMessage: {type(e).__name__}")
 
 
 def send_photo(png_bytes: bytes, caption: str = "", buttons=None):
-    """Скриншот в Telegram (опционально с кнопками под ним)."""
     token, chat_id = _creds()
     if not token or not chat_id:
         return
@@ -66,11 +64,10 @@ def send_photo(png_bytes: bytes, caption: str = "", buttons=None):
             timeout=30,
         )
     except Exception as e:
-        logger.warning(f"Не удалось отправить фото: {type(e).__name__}")
+        logger.warning(f"sendPhoto: {type(e).__name__}")
 
 
 def answer_callback(callback_id: str, text: str = ""):
-    """Убирает «часики» на кнопке и показывает короткий тост."""
     token, _ = _creds()
     if not token:
         return
@@ -85,7 +82,7 @@ def answer_callback(callback_id: str, text: str = ""):
 
 
 def get_update_offset():
-    """Смещение, после которого идут только НОВЫЕ события."""
+    """offset после последнего известного апдейта (чтобы не получать старые)."""
     token, _ = _creds()
     if not token:
         return None
@@ -104,7 +101,9 @@ def get_update_offset():
 
 def get_updates(offset, timeout=8):
     """Long-poll. Возвращает (события, новый_offset).
-    События только из вашего чата: ("cb", callback_id, data) или ("text", None, текст)."""
+    События только из вашего чата:
+      ("cb", callback_id, data)  — нажатие кнопки
+      ("text", None, текст)      — текстовое сообщение (ответ на капчу)"""
     token, chat_id = _creds()
     if not token or not chat_id:
         time.sleep(timeout)
